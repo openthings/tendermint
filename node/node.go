@@ -18,10 +18,11 @@ import (
 
 	bc "github.com/tendermint/tendermint/blockchain"
 	cfg "github.com/tendermint/tendermint/config"
-	"github.com/tendermint/tendermint/consensus"
+	cs "github.com/tendermint/tendermint/consensus"
 	"github.com/tendermint/tendermint/evidence"
 	mempl "github.com/tendermint/tendermint/mempool"
 	"github.com/tendermint/tendermint/p2p"
+	"github.com/tendermint/tendermint/p2p/pex"
 	"github.com/tendermint/tendermint/p2p/trust"
 	"github.com/tendermint/tendermint/proxy"
 	rpccore "github.com/tendermint/tendermint/rpc/core"
@@ -97,20 +98,20 @@ type Node struct {
 
 	// network
 	sw               *p2p.Switch             // p2p connections
-	addrBook         *p2p.AddrBook           // known peers
+	addrBook         pex.AddrBook            // known peers
 	trustMetricStore *trust.TrustMetricStore // trust metrics for all peers
 
 	// services
 	eventBus         *types.EventBus // pub/sub for services
 	stateDB          dbm.DB
-	blockStore       *bc.BlockStore              // store the blockchain to disk
-	bcReactor        *bc.BlockchainReactor       // for fast-syncing
-	mempoolReactor   *mempl.MempoolReactor       // for gossipping transactions
-	consensusState   *consensus.ConsensusState   // latest consensus state
-	consensusReactor *consensus.ConsensusReactor // for participating in the consensus
-	evidencePool     *evidence.EvidencePool      // tracking evidence
-	proxyApp         proxy.AppConns              // connection to the application
-	rpcListeners     []net.Listener              // rpc servers
+	blockStore       *bc.BlockStore         // store the blockchain to disk
+	bcReactor        *bc.BlockchainReactor  // for fast-syncing
+	mempoolReactor   *mempl.MempoolReactor  // for gossipping transactions
+	consensusState   *cs.ConsensusState     // latest consensus state
+	consensusReactor *cs.ConsensusReactor   // for participating in the consensus
+	evidencePool     *evidence.EvidencePool // tracking evidence
+	proxyApp         proxy.AppConns         // connection to the application
+	rpcListeners     []net.Listener         // rpc servers
 	txIndexer        txindex.TxIndexer
 	indexerService   *txindex.IndexerService
 }
@@ -158,7 +159,7 @@ func NewNode(config *cfg.Config,
 	// and sync tendermint and the app by performing a handshake
 	// and replaying any necessary blocks
 	consensusLogger := logger.With("module", "consensus")
-	handshaker := consensus.NewHandshaker(stateDB, state, blockStore)
+	handshaker := cs.NewHandshaker(stateDB, state, blockStore)
 	handshaker.SetLogger(consensusLogger)
 	proxyApp := proxy.NewAppConns(clientCreator, handshaker)
 	proxyApp.SetLogger(logger.With("module", "proxy"))
@@ -219,13 +220,13 @@ func NewNode(config *cfg.Config,
 	bcReactor.SetLogger(logger.With("module", "blockchain"))
 
 	// Make ConsensusReactor
-	consensusState := consensus.NewConsensusState(config.Consensus, state.Copy(),
+	consensusState := cs.NewConsensusState(config.Consensus, state.Copy(),
 		blockExec, blockStore, mempool, evidencePool)
 	consensusState.SetLogger(consensusLogger)
 	if privValidator != nil {
 		consensusState.SetPrivValidator(privValidator)
 	}
-	consensusReactor := consensus.NewConsensusReactor(consensusState, fastSync)
+	consensusReactor := cs.NewConsensusReactor(consensusState, fastSync)
 	consensusReactor.SetLogger(consensusLogger)
 
 	p2pLogger := logger.With("module", "p2p")
@@ -238,10 +239,10 @@ func NewNode(config *cfg.Config,
 	sw.AddReactor("EVIDENCE", evidenceReactor)
 
 	// Optionally, start the pex reactor
-	var addrBook *p2p.AddrBook
+	var addrBook pex.AddrBook
 	var trustMetricStore *trust.TrustMetricStore
 	if config.P2P.PexReactor {
-		addrBook = p2p.NewAddrBook(config.P2P.AddrBookFile(), config.P2P.AddrBookStrict)
+		addrBook = pex.NewAddrBook(config.P2P.AddrBookFile(), config.P2P.AddrBookStrict)
 		addrBook.SetLogger(p2pLogger.With("book", config.P2P.AddrBookFile()))
 
 		// Get the trust metric history data
@@ -256,8 +257,8 @@ func NewNode(config *cfg.Config,
 		if config.P2P.Seeds != "" {
 			seeds = strings.Split(config.P2P.Seeds, ",")
 		}
-		pexReactor := p2p.NewPEXReactor(addrBook,
-			&p2p.PEXReactorConfig{Seeds: seeds})
+		pexReactor := pex.NewPEXReactor(addrBook,
+			&pex.PEXReactorConfig{Seeds: seeds})
 		pexReactor.SetLogger(p2pLogger)
 		sw.AddReactor("PEX", pexReactor)
 	}
@@ -502,12 +503,12 @@ func (n *Node) BlockStore() *bc.BlockStore {
 }
 
 // ConsensusState returns the Node's ConsensusState.
-func (n *Node) ConsensusState() *consensus.ConsensusState {
+func (n *Node) ConsensusState() *cs.ConsensusState {
 	return n.consensusState
 }
 
 // ConsensusReactor returns the Node's ConsensusReactor.
-func (n *Node) ConsensusReactor() *consensus.ConsensusReactor {
+func (n *Node) ConsensusReactor() *cs.ConsensusReactor {
 	return n.consensusReactor
 }
 
@@ -551,14 +552,24 @@ func (n *Node) makeNodeInfo(pubKey crypto.PubKey) p2p.NodeInfo {
 		PubKey:  pubKey,
 		Network: n.genesisDoc.ChainID,
 		Version: version.Version,
+		Channels: []byte{
+			bc.BlockchainChannel,
+			cs.StateChannel, cs.DataChannel, cs.VoteChannel, cs.VoteSetBitsChannel,
+			mempl.MempoolChannel,
+			evidence.EvidenceChannel,
+		},
 		Moniker: n.config.Moniker,
 		Other: []string{
 			cmn.Fmt("wire_version=%v", wire.Version),
 			cmn.Fmt("p2p_version=%v", p2p.Version),
-			cmn.Fmt("consensus_version=%v", consensus.Version),
+			cmn.Fmt("consensus_version=%v", cs.Version),
 			cmn.Fmt("rpc_version=%v/%v", rpc.Version, rpccore.Version),
 			cmn.Fmt("tx_index=%v", txIndexerStatus),
 		},
+	}
+
+	if n.config.P2P.PexReactor {
+		nodeInfo.Channels = append(nodeInfo.Channels, pex.PexChannel)
 	}
 
 	rpcListenAddr := n.config.RPC.ListenAddress
